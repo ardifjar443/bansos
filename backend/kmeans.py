@@ -86,20 +86,34 @@ def train_kmeans():
         for col in cols_num:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-        # 3. FILTERING (DILONGGARKAN)
-        # Hanya filter Status Nonaktif. Jangan filter Desil/Peringkat 0 agar data tetap masuk.
-        df_aktif = df[df["status_nonaktif"] == 0].copy()
+        # ============================================================
+        # 3. FILTERING KETAT (FILTER REQUEST USER)
+        # ============================================================
         
-        # Jika kosong setelah filter aktif
-        if len(df_aktif) == 0:
+        # A. Filter Status Aktif (Status = 0)
+        df_aktif = df[df["status_nonaktif"] == 0].copy()
+
+        # B. Filter Wajib Ada Nilai (Desil > 0 DAN Peringkat > 0)
+        #    Data dengan nilai 0 akan DIBUANG.
+        df_valid = df_aktif[
+            (df_aktif["rata_rata_desil"] > 0) & 
+            (df_aktif["peringkat_nasional"] > 0)
+        ].copy()
+        
+        # Cek jika data habis setelah difilter
+        if len(df_valid) == 0:
             return {
                 "status": "error",
-                "message": "Data kosong setelah filter status_nonaktif.",
-                "diagnostik": {"total_awal": total_awal, "sisa_aktif": 0}
+                "message": "Tidak ada data valid untuk diproses. Pastikan data memiliki Desil > 0 dan Peringkat Nasional > 0.",
+                "diagnostik": {
+                    "total_data_awal": total_awal,
+                    "lolos_status_aktif": len(df_aktif),
+                    "lolos_validasi_nilai": 0
+                }
             }
 
-        # Gunakan df_aktif sebagai df utama
-        df = df_aktif.reset_index(drop=True)
+        # Gunakan df_valid sebagai df utama
+        df = df_valid.reset_index(drop=True)
 
         # 4. PROSES FEATURING & KMEANS
         parsed_bpnt = df["periode_terakhir_bpnt"].apply(parse_period).tolist()
@@ -117,23 +131,22 @@ def train_kmeans():
         scaler_A = MinMaxScaler()
         X_A_scaled = scaler_A.fit_transform(X_A)
 
-        # Handle jika data < 3 baris (KMeans butuh data)
+        # Handle jika data < 3 baris
         n_clusters = 3 if len(df) >= 3 else 1
         kmeans_A = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         df["cluster_kerentanan"] = kmeans_A.fit_predict(X_A_scaled)
 
-        # Mapping Label (Hati-hati jika cluster < 3)
+        # Mapping Label
         cluster_means = df.groupby("cluster_kerentanan")["rata_rata_desil"].mean()
         order = cluster_means.sort_values().index.tolist()
         
-        # Dinamis mapping label berdasarkan jumlah cluster yang terbentuk
         labels_sorted = ["Sangat Rentan", "Rentan", "Tidak Rentan"]
         cluster_to_label = {}
         for i, cluster_id in enumerate(order):
             if i < len(labels_sorted):
                 cluster_to_label[cluster_id] = labels_sorted[i]
             else:
-                cluster_to_label[cluster_id] = "Tidak Rentan" # Default fallback
+                cluster_to_label[cluster_id] = "Tidak Rentan"
 
         df["kategori_kerentanan"] = df["cluster_kerentanan"].map(cluster_to_label)
 
@@ -157,9 +170,7 @@ def train_kmeans():
         }
         joblib.dump(artifacts, "model_kerentanan_artifacts.pkl")
 
-       # ... (Kode sebelumnya sama) ...
-        
-        # 5. INSERT KE DATABASE DENGAN BATCHING (CHUNK INSERT)
+        # 5. INSERT KE DATABASE (BATCHING + UUID FIX)
         cursor = conn.cursor()
         
         # Bersihkan tabel dulu
@@ -171,11 +182,10 @@ def train_kmeans():
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         
-        # Siapkan data (pastikan konversi tipe data sudah benar seperti sebelumnya)
         data_to_insert = []
         for _, row in df.iterrows():
             val = (
-                str(row["id_keluarga"]),  # Tetap gunakan str() untuk UUID
+                str(row["id_keluarga"]),  # FIX: UUID string
                 int(row["cluster_kerentanan"]),               
                 str(row["kategori_kerentanan"]),
                 int(row["skor_kerentanan"]),
@@ -193,27 +203,25 @@ def train_kmeans():
             )
             data_to_insert.append(val)
 
-        # === LOGIKA BATCHING DI SINI ===
-        batch_size = 1000  # Kirim per 1000 baris agar ringan
+        # Batch Insert
+        batch_size = 1000 
         total_inserted = 0
 
         if data_to_insert:
-            print(f"Mulai insert {len(data_to_insert)} data dengan batch size {batch_size}...")
-            
+            print(f"Mulai insert {len(data_to_insert)} data valid...")
             for i in range(0, len(data_to_insert), batch_size):
                 batch = data_to_insert[i : i + batch_size]
                 try:
                     cursor.executemany(insert_sql, batch)
-                    conn.commit() # Commit per batch agar aman
+                    conn.commit()
                     total_inserted += len(batch)
-                    print(f" -> Berhasil insert batch {i} s/d {i + len(batch)}")
+                    print(f" -> Batch {i} OK.")
                 except Exception as e:
-                    print(f"Error pada batch {i}: {e}")
-                    # Opsional: Break atau continue tergantung kebutuhan
+                    print(f"Error Batch {i}: {e}")
             
-            msg = f"Selesai. Total berhasil disimpan: {total_inserted} data."
+            msg = f"Sukses. {total_inserted} data disimpan (Data Desil/Peringkat 0 dibuang)."
         else:
-            msg = "Proses selesai tapi data final kosong."
+            msg = "Proses selesai, namun tidak ada data valid untuk disimpan."
 
         return {
             "status": "success",
@@ -221,13 +229,11 @@ def train_kmeans():
             "info": msg,
             "diagnostik": {
                 "total_awal": total_awal,
-                "total_setelah_filter": len(df)
+                "total_valid_disimpan": total_inserted
             }
         }
-        # ... (sisanya sama)
 
     except Exception as e:
-        # Print error ke console agar terlihat di terminal
         print("ERROR:", str(e))
         return {"status": "error", "message": str(e)}
     finally:
